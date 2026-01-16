@@ -1,8 +1,0 @@
-### Register Stage 1 User
-POST http://localhost:3000/api/users/register
-Content-Type: application/json
-
-{
-  "username": "test_stage1",
-  "publicKey": "pub123"
-}

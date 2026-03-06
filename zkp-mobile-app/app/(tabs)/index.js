@@ -1,308 +1,252 @@
-import React, { useState, useEffect } from 'react';
+// @ts-nocheck
+import React, { useState, useEffect, useRef } from 'react';
+import { StyleSheet, Text, View, TouchableOpacity, Alert, TextInput, Keyboard, TouchableWithoutFeedback } from 'react-native';
 import { CameraView, Camera } from "expo-camera";
 import * as LocalAuthentication from 'expo-local-authentication';
 import * as Haptics from 'expo-haptics';
 import { io } from 'socket.io-client';
 import * as SecureStore from 'expo-secure-store';
-import * as OTPAuth from "otpauth";
 import * as Crypto from 'expo-crypto';
 import { CryptoService } from '../../cryptoService';
-import { StyleSheet, Text, View, TouchableOpacity, Alert, TextInput } from 'react-native'; // <-- Added TextInput
 
-// ⚠️ CONFIRM YOUR PC IP ADDRESS
-const PC_IP = "192.168.100.10";
-const BACKEND_URL = `http://${PC_IP}:3000`;
-// const MOBILE_USERNAME = "MobileUser";
+// 🌍 PUBLIC CLOUD UPLINK (Ngrok)
+const BACKEND_URL = `https://eliz-nonrefracting-rosendo.ngrok-free.dev`;
 
 export default function App() {
     const [username, setUsername] = useState("");
-    const [isRegistered, setIsRegistered] = useState(false); // To track if we should show input or not
+    const [isRegistered, setIsRegistered] = useState(false);
     const [hasPermission, setHasPermission] = useState(null);
     const [scanned, setScanned] = useState(false);
-    const [status, setStatus] = useState("Ready");
-    const [socket, setSocket] = useState(null);
+    const [status, setStatus] = useState("Initializing...");
+    const [pukKey, setPukKey] = useState(null);
 
-    // TOTP State
-    const [totpSecret, setTotpSecret] = useState(null);
-    const [totpCode, setTotpCode] = useState("--- ---");
-    const [timeLeft, setTimeLeft] = useState(30);
+    const socketRef = useRef(null);
 
-    // 1. Setup
+    // 1. SETUP
     useEffect(() => {
+        let active = true;
         const setup = async () => {
             const { status } = await Camera.requestCameraPermissionsAsync();
+            if (!active) return;
             setHasPermission(status === "granted");
 
-            console.log(`Connecting to ${BACKEND_URL}...`);
-            const newSocket = io(BACKEND_URL);
-            setSocket(newSocket);
+            const sock = io(BACKEND_URL, { transports: ['websocket'],
+                extraHeaders: {
+                    "ngrok-skip-browser-warning": "true"
+                } });
+            socketRef.current = sock;
 
-            newSocket.on('connect', () => setStatus("Connected to PC"));
-            newSocket.on('connect_error', () => setStatus("Connection Failed - Check IP"));
+            sock.on('connect', () => setStatus("Connected to System"));
+            sock.on('connect_error', () => setStatus("Offline - Check IP"));
 
-            checkRegistration();
+            await checkRegistration();
         };
         setup();
+        return () => {
+            active = false;
+            if (socketRef.current) socketRef.current.disconnect();
+        };
     }, []);
 
-    // 2. Check if already registered
+    // 2. CHECK REGISTRATION
     const checkRegistration = async () => {
-        const savedSecret = await SecureStore.getItemAsync('totp_secret');
-        const savedName = await SecureStore.getItemAsync('mobile_username');
-        if (savedSecret && savedName) {
-            setTotpSecret(savedSecret);
-            setUsername(savedName); // Restore the name
-            setIsRegistered(true);
-        } else {
-            setTotpSecret(null);
-            setIsRegistered(false);
+        try {
+            const savedPuk = await SecureStore.getItemAsync('puk_key');
+            const savedName = await SecureStore.getItemAsync('mobile_username');
+
+            if (savedPuk && savedName) {
+                setPukKey(savedPuk);
+                setUsername(savedName);
+                setIsRegistered(true);
+                setStatus("Ready to Scan");
+            } else {
+                setIsRegistered(false);
+                setStatus("Setup Required");
+            }
+        } catch {
+            setStatus("Storage Error");
         }
     };
 
-    // 3. TOTP Timer
-    useEffect(() => {
-        if (!totpSecret) return;
-        const interval = setInterval(() => {
-            const totp = new OTPAuth.TOTP({
-                issuer: "ZK-Auth",
-                label: username,
-                algorithm: "SHA1",
-                digits: 6,
-                period: 30,
-                secret: OTPAuth.Secret.fromBase32(totpSecret)
-            });
-            const code = totp.generate();
-            setTotpCode(code.slice(0,3) + " " + code.slice(3));
-            const epoch = Math.floor(Date.now() / 1000);
-            setTimeLeft(30 - (epoch % 30));
-        }, 1000);
-        return () => clearInterval(interval);
-    }, [totpSecret]);
-
-    // 4. Generate Random Base32 Secret
-    const generateBase32Secret = async () => {
-        const randomBytes = await Crypto.getRandomBytesAsync(20);
-        const alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567';
-        let output = '';
-        for (let i = 0; i < randomBytes.length; i++) output += alphabet[randomBytes[i] % 32];
-        return output;
-    };
-
-    // 5. MANUAL REGISTER
+    // 3. REGISTER DEVICE (Old UI Logic + Readable PUK)
     const handleManualRegister = async () => {
         if (!username.trim()) {
-            Alert.alert("Error", "Please enter a unique username");
+            Alert.alert("Error", "Username required");
             return;
         }
+        Keyboard.dismiss();
+
         try {
-            setStatus("⏳ Registering...");
+            setStatus("Generating Identity...");
+
+            // ZKP Keys
             const secretX = await CryptoService.getOrGenerateSecret();
             const keys = await CryptoService.getPublicKeys(secretX);
-            const newTotpSecret = await generateBase32Secret();
+
+            // 🔥 READABLE PUK LOGIC (Better for Hard Reset)
+            const cleanUser = username.trim().toUpperCase().replace(/\s/g, '');
+            const generatedPuk = `ZK-${cleanUser}-001`;
 
             const response = await fetch(`${BACKEND_URL}/api/register`, {
                 method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
+                headers: { 'Content-Type': 'application/json',
+                    'ngrok-skip-browser-warning': 'true' },
                 body: JSON.stringify({
                     username: username,
                     publicKeyY: keys.y,
-                    publicKeyZ: keys.z,
-                    totpSecret: newTotpSecret
+                    publicKeyZ: keys.z
                 })
             });
 
-            if (response.ok) {
-                await SecureStore.setItemAsync('totp_secret', newTotpSecret);
-                await SecureStore.setItemAsync('mobile_username', username);
-                setTotpSecret(newTotpSecret);
-                setIsRegistered(true);
-                Alert.alert("✅ Success", `Device Registered as ${username}!`);
-                setStatus("Registered! Ready to Scan.");
-            } else {
+            if (!response.ok) {
                 const err = await response.json();
                 throw new Error(err.message || "Server rejected");
             }
+
+            await SecureStore.setItemAsync('puk_key', generatedPuk);
+            await SecureStore.setItemAsync('mobile_username', username);
+
+            setPukKey(generatedPuk);
+            setIsRegistered(true);
+            setStatus("Ready to Scan");
+
+            Alert.alert("Device Paired", `Identity: ${username}\nPUK stored in Vault.`);
+
         } catch (e) {
-            Alert.alert("Error", e.message);
             setStatus("Registration Failed");
+            Alert.alert("Registration Failed", e.message);
         }
     };
 
-    // 6. RESET APP (Clear Data)
+    // 4. WIPE
     const handleReset = async () => {
-        try {
-            // 1. Delete the TOTP Secret (The Backup Code)
-            await SecureStore.deleteItemAsync('totp_secret');
+        Alert.alert("Unlink Device?", "This will remove your identity.", [
+            { text: "Cancel", style: "cancel" },
+            {
+                text: "Unlink & Delete",
+                style: "destructive",
+                onPress: async () => {
+                    try {
+                        // 1. Attempt to delete from Server
+                        // We use the current state 'username'
+                        if (username) {
+                            await fetch(`${BACKEND_URL}/api/delete-user`, {
+                                method: 'POST',
+                                headers: { 'Content-Type': 'application/json',
+                    'ngrok-skip-browser-warning': 'true' },
+                                body: JSON.stringify({ username })
+                            });
+                        }
+                    } catch (e) {
+                        // If server is down, we don't care. We must wipe local data anyway.
+                        console.log("Server cleanup failed (Offline?), proceeding to local wipe.");
+                    }
 
-            // 2. Delete the ZK Private Key (The Identity)
-            await SecureStore.deleteItemAsync('zkp_secret_v1');
+                    // 2. Wipe Local Secure Storage
+                    await SecureStore.deleteItemAsync('puk_key');
+                    await SecureStore.deleteItemAsync('zkp_secret_v1');
+                    await SecureStore.deleteItemAsync('mobile_username');
 
-            // 3. Deletes Name
-            await SecureStore.deleteItemAsync('mobile_username');
+                    // 3. Reset State
+                    setPukKey(null);
+                    setUsername("");
+                    setIsRegistered(false);
+                    setStatus("Identity Wiped");
 
-            // 4. Reset Local State
-            setTotpSecret(null);
-            setTotpCode("--- ---");
-            setIsRegistered(false);
-            setUsername(""); // Clear input
-            setStatus("App Reset. Please Register again.");
-
-            Alert.alert(
-                "Identity Wiped",
-                "Your cryptographic keys have been destroyed. You can now register as a fresh device."
-            );
-        } catch (e) {
-            console.error(e);
-            Alert.alert("Reset Error", "Could not fully wipe data.");
-        }
+                    Alert.alert("Device Unlinked", "Identity removed from Device & Server.");
+                }
+            }
+        ]);
     };
 
-    // 7. SCAN LOGIC (FIXED FOR PROTOCOL 6)
-    const handleBarCodeScanned = async ({ type, data }) => {
+    // 5. SCAN LOGIC (Syncs PUK Hash to PC)
+    const handleBarCodeScanned = async ({ data }) => {
         if (scanned) return;
         setScanned(true);
         Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
 
         try {
-            let qrData;
-            try { qrData = JSON.parse(data); } catch (e) { throw new Error("Invalid QR"); }
-            if (!qrData.sessionId) throw new Error("No Session ID");
+            const qrData = JSON.parse(data);
 
-            setStatus("Verifying Biometrics...");
-            const bioAuth = await LocalAuthentication.authenticateAsync({
-                promptMessage: 'Login to PC',
-                disableDeviceFallback: false,
+            // 🔵 REMOTE UNLOCK + SYNC HANDSHAKE
+            if (qrData.type === 'remote_unlock' && qrData.targetSocketId) {
+
+                const bio = await LocalAuthentication.authenticateAsync({
+                    promptMessage: 'Confirm Remote Unlock'
+                });
+                if (!bio.success) throw new Error("Biometric rejected");
+
+                // Hash the PUK before sending (Security Best Practice)
+                const pukHash = await Crypto.digestStringAsync(
+                    Crypto.CryptoDigestAlgorithm.SHA256,
+                    pukKey
+                );
+
+                socketRef.current.emit('force_unlock_pc', {
+                    targetSocketId: qrData.targetSocketId,
+                    pukHash,
+                    username: username
+                });
+
+                setStatus("PC Unlocked & Synced");
+                Alert.alert("Success", "PC unlocked & Identity Synced");
+                return;
+            }
+
+            // 🔵 ZKP LOGIN
+            if (!qrData.sessionId) throw new Error("Invalid QR");
+
+            const bio = await LocalAuthentication.authenticateAsync({
+                promptMessage: 'Authorize Login'
             });
-            if (!bioAuth.success) throw new Error("Biometrics cancelled");
+            if (!bio.success) throw new Error("Biometric rejected");
 
-            setStatus("Generating Proof...");
             const secretX = await CryptoService.getOrGenerateSecret();
             const proof = await CryptoService.generateProof(secretX, qrData.sessionId);
 
-            setStatus("Sending Proof...");
             const response = await fetch(`${BACKEND_URL}/api/login`, {
                 method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ username: username, ...proof })
+                headers: { 'Content-Type': 'application/json',
+                    'ngrok-skip-browser-warning': 'true' },
+                body: JSON.stringify({ username, ...proof })
             });
 
-            // 🛑 CHECK RESPONSE CAREFULLY
-            if (!response.ok) {
-                // Try to read the error message from the server
-                let errorMessage = "Login Failed";
-                try {
-                    const errorData = await response.json();
-                    errorMessage = errorData.message || errorMessage;
-                } catch (e) { /* No JSON body */ }
+            if (!response.ok) throw new Error("Login failed");
 
-                console.log("Server Error:", response.status, errorMessage);
+            socketRef.current.emit('mobile_authenticated', {
+                sessionId: qrData.sessionId,
+                username
+            });
 
-                // TRIGGER WIPE CONDITIONS:
-                // 1. Status is 404 (Not Found)
-                // 2. OR The message says "User not found" / "not exist"
-                if (response.status === 404 ||
-                    response.status === 500 ||
-                    errorMessage.toLowerCase().includes("not found") ||
-                    errorMessage.toLowerCase().includes("exist") ||
-                    errorMessage.toLowerCase().includes("calculation error")) {
-                    throw new Error("PROTOCOL_6_WIPE");
-                }
+            setStatus("Login Successful");
+            Alert.alert("Access Granted");
 
-                throw new Error(errorMessage);
-            }
-
-            if (socket) socket.emit('mobile_authenticated', { sessionId: qrData.sessionId, username: username });
-
-            setStatus("✅ PC Unlocked!");
-            Alert.alert("Success", "PC Unlocked!");
-
-        } catch (error) {
-            console.log("Catch Error:", error.message);
-
-            // 🛑 THE MAGIC HAPPENS HERE
-            if (error.message === "PROTOCOL_6_WIPE") {
-                Haptics.notificationAsync(Haptics.NotificationFeedbackType.Error);
-                Alert.alert(
-                    "⛔ IDENTITY TERMINATED",
-                    "Security Alert: This identity was burnt on the terminal. The keys are no longer valid.\n\nInitiating Safety Wipe...",
-                    [
-                        {
-                            text: "Wipe Device Now",
-                            onPress: async () => {
-                                await handleReset(); // Calls your existing reset function
-                            },
-                            style: "destructive"
-                        }
-                    ]
-                );
-                return; // Stop here, don't show the normal error
-            }
-
-            setStatus("❌ " + error.message);
-            Alert.alert("Login Error", error.message);
+        } catch (e) {
+            setStatus("❌ " + e.message);
+            Alert.alert("Scan Error", e.message);
+        } finally {
+            setTimeout(() => {
+                setScanned(false);
+                setStatus("Ready to Scan");
+            }, 3000);
         }
-
-        setTimeout(() => { setScanned(false); setStatus("Ready to Scan"); }, 4000);
     };
 
-    if (hasPermission === null) return <View style={styles.container}><Text style={styles.text}>Requesting permission...</Text></View>;
-    if (hasPermission === false) return <View style={styles.container}><Text style={styles.text}>No access to camera</Text></View>;
+    // UI RENDERING
+    if (hasPermission === null) return <View style={styles.center}><Text style={styles.text}>Requesting permissions...</Text></View>;
+    if (hasPermission === false) return <View style={styles.center}><Text style={styles.text}>No camera access</Text></View>;
 
     return (
-        <View style={styles.container}>
-            <Text style={styles.title}>ZK-Authenticator</Text>
+        <TouchableWithoutFeedback onPress={Keyboard.dismiss}>
+            <View style={styles.container}>
+                <Text style={styles.title}>ZK-Authenticator</Text>
 
-            {/* CAMERA SECTION */}
-            <View style={styles.cameraContainer}>
-                <CameraView
-                    onBarcodeScanned={scanned ? undefined : handleBarCodeScanned}
-                    barcodeScannerSettings={{ barcodeTypes: ["qr", "pdf417"] }}
-                    style={StyleSheet.absoluteFillObject}
-                />
-            </View>
-
-            <Text style={[styles.status, scanned && styles.statusActive]}>{status}</Text>
-
-            {/* DYNAMIC CONTENT: TOTP OR REGISTER */}
-            {totpSecret ? (
-                <View style={styles.totpContainer}>
-                    <View style={styles.secureBadge}>
-                        <Text style={styles.secureText}>ENCRYPTED VAULT</Text>
-                    </View>
-
-                    <Text style={styles.totpLabel}>Identity Backup Code</Text>
-
-                    {/* Display the Username clearly */}
-                    <Text style={{color: '#94a3b8', fontSize: 14, marginBottom: 10}}>
-                        User: <Text style={{color: '#fff', fontWeight: 'bold'}}>{username}</Text>
-                    </Text>
-
-                    {/* Digital Clock Style Code */}
-                    <Text style={styles.totpCode}>{totpCode}</Text>
-
-                    {/* Dynamic Color Progress Bar */}
-                    <View style={styles.timerBar}>
-                        <View style={{
-                            ...styles.timerFill,
-                            width: `${(timeLeft/30)*100}%`,
-                            backgroundColor: timeLeft < 6 ? '#ef4444' : timeLeft < 15 ? '#f59e0b' : '#10b981'
-                        }} />
-                    </View>
-                    <Text style={{color: '#64748b', fontSize: 10, marginTop: 5, fontFamily: 'monospace'}}>
-                        Expires in {timeLeft}s
-                    </Text>
-
-                    <TouchableOpacity onPress={handleReset} style={styles.resetLink}>
-                        <Text style={styles.resetText}>⚠ UNLINK DEVICE</Text>
-                    </TouchableOpacity>
-                </View>
-            ) : (
-                !scanned && (
+                {/* --- 1. OLD REGISTRATION UI --- */}
+                {!isRegistered && (
                     <View style={{width: '100%', alignItems: 'center'}}>
-                        {/* NEW INPUT FIELD */}
                         <TextInput
                             style={styles.input}
-                            placeholder="Enter Unique Username"
+                            placeholder="Enter Username"
                             placeholderTextColor="#64748b"
                             value={username}
                             onChangeText={setUsername}
@@ -311,35 +255,55 @@ export default function App() {
                         <TouchableOpacity style={styles.regButton} onPress={handleManualRegister}>
                             <Text style={styles.buttonText}>📝 Register Device</Text>
                         </TouchableOpacity>
+                        <Text style={[styles.status, {marginTop: 20}]}>{status}</Text>
                     </View>
-                )
-            )}
+                )}
 
-            {scanned && (
-                <TouchableOpacity style={styles.button} onPress={() => setScanned(false)}>
-                    <Text style={styles.buttonText}>Scan Again</Text>
-                </TouchableOpacity>
-            )}
-        </View>
+                {/* --- 2. SCANNER UI --- */}
+                {isRegistered && (
+                    <>
+                        <View style={styles.cameraContainer}>
+                            <CameraView
+                                onBarcodeScanned={scanned ? undefined : handleBarCodeScanned}
+                                barcodeScannerSettings={{ barcodeTypes: ["qr"] }}
+                                style={StyleSheet.absoluteFillObject}
+                            />
+                        </View>
+
+                        <Text style={[styles.status, scanned && styles.statusActive]}>{status}</Text>
+
+                        {/* Info Card (Replaces TOTP Box) */}
+                        <View style={styles.totpContainer}>
+                            <View style={styles.secureBadge}>
+                                <Text style={styles.secureText}>ACTIVE IDENTITY</Text>
+                            </View>
+                            <Text style={styles.totpCode}>{username}</Text>
+                            <Text style={{color: '#64748b', fontSize: 10, marginTop: 5}}>PUK Securely Stored in Vault</Text>
+
+                            <TouchableOpacity onPress={handleReset} style={styles.resetLink}>
+                                <Text style={styles.resetText}>⚠ UNLINK DEVICE</Text>
+                            </TouchableOpacity>
+                        </View>
+                    </>
+                )}
+
+                {scanned && (
+                    <TouchableOpacity style={styles.button} onPress={() => setScanned(false)}>
+                        <Text style={styles.buttonText}>Scan Again</Text>
+                    </TouchableOpacity>
+                )}
+            </View>
+        </TouchableWithoutFeedback>
     );
 }
 
 const styles = StyleSheet.create({
-    input: {
-        backgroundColor: '#1e293b',
-        width: '100%',
-        padding: 15,
-        borderRadius: 12,
-        color: '#fff',
-        borderWidth: 1,
-        borderColor: '#334155',
-        marginBottom: 10,
-        textAlign: 'center',
-        fontSize: 16
-    },
+    center: { flex: 1, backgroundColor: '#0f172a', alignItems: 'center', justifyContent: 'center' },
     container: { flex: 1, backgroundColor: '#0f172a', alignItems: 'center', justifyContent: 'center', padding: 20 },
     title: { color: '#3b82f6', fontSize: 24, fontWeight: 'bold', marginBottom: 20 },
     text: { color: '#fff' },
+
+    // OLD STYLE CAMERA (Blue Border)
     cameraContainer: {
         width: 260, height: 260, borderRadius: 24, overflow: 'hidden',
         borderWidth: 3, borderColor: '#3b82f6', marginBottom: 20,
@@ -348,10 +312,14 @@ const styles = StyleSheet.create({
 
     status: { color: '#94a3b8', fontSize: 13, textAlign: 'center', marginBottom: 20, fontWeight: '600', height: 20, textTransform: 'uppercase', letterSpacing: 1 },
     statusActive: { color: '#4ade80' },
+
+    // OLD STYLE BUTTONS & INPUTS
+    input: { backgroundColor: '#1e293b', width: '100%', padding: 15, borderRadius: 12, color: '#fff', borderWidth: 1, borderColor: '#334155', marginBottom: 10, textAlign: 'center', fontSize: 16 },
     button: { backgroundColor: '#3b82f6', paddingVertical: 14, paddingHorizontal: 30, borderRadius: 12, marginTop: 10, width: '100%', alignItems: 'center' },
     regButton: { backgroundColor: '#10b981', paddingVertical: 14, paddingHorizontal: 30, borderRadius: 12, marginTop: 10, width: '100%', alignItems: 'center' },
     buttonText: { color: '#fff', fontWeight: 'bold', fontSize: 16 },
 
+    // CARD STYLE (Matches your old TOTP box)
     totpContainer: {
         marginTop: 10, alignItems: 'center', backgroundColor: '#1e293b',
         paddingVertical: 25, paddingHorizontal: 20, borderRadius: 20, width: '100%',
@@ -360,16 +328,7 @@ const styles = StyleSheet.create({
     },
     secureBadge: { backgroundColor: '#0f172a', paddingHorizontal: 10, paddingVertical: 4, borderRadius: 20, marginBottom: 15, borderWidth: 1, borderColor: '#3b82f6' },
     secureText: { color: '#3b82f6', fontSize: 10, fontWeight: 'bold', letterSpacing: 1 },
-
-    totpLabel: { color: '#64748b', fontSize: 12, textTransform: 'uppercase', marginBottom: 8, fontWeight: '600' },
-
-    totpCode: {
-        color: '#f1f5f9', fontSize: 36, fontFamily: 'monospace', fontWeight: 'bold', letterSpacing: 4,
-        textShadowColor: 'rgba(255, 255, 255, 0.2)', textShadowOffset: { width: 0, height: 0 }, textShadowRadius: 10
-    },
-
-    timerBar: { height: 6, width: '100%', backgroundColor: '#0f172a', borderRadius: 3, marginTop: 15, overflow: 'hidden' },
-    timerFill: { height: '100%', borderRadius: 3 }, // Background color is now handled inline in the JSX
+    totpCode: { color: '#f1f5f9', fontSize: 24, fontWeight: 'bold', letterSpacing: 1 },
 
     resetLink: { marginTop: 25, padding: 10, opacity: 0.8 },
     resetText: { color: '#ef4444', fontSize: 11, fontWeight: 'bold', textTransform: 'uppercase', letterSpacing: 1 }
